@@ -16,12 +16,16 @@ library(DT)
 library(shinycssloaders)
 library("RcppRoll")
 library(jsonlite)
+library(data.table)
+library(zoo)
 
 options(scipen=999)
 
-horizon <- "DAILY"#"INTRADAY"
+horizon <- "DAILY"
+#"INTRADAY"
 symbol <- "DIA"
-interval <- ""#"&interval=1min"
+interval <- ""
+  #"&interval=60min"
 #only for intraday, allowable: 1-5-15-30-60min
 
 scrty <- fromJSON(
@@ -48,6 +52,10 @@ p <- 9
 a <- 2/(m+1)
 l <- 1
 
+#add buy/sell signals strat: https://www.dailyfx.com/forex/education/trading_tips/daily_trading_lesson/2020/01/09/macd-histogram.html
+## strategy: check last 5 slope and if we are increasing (decreasing) and max (min) value for buy (sell)
+last_n <- 5
+
 df <- df %>% 
     #arrange(desc(date)) %>% 
     #slice(1:(100)) %>% 
@@ -67,11 +75,60 @@ df <- df %>%
            hist=macd-signal
     ) %>% 
     drop_na() %>% 
-    mutate(hist_n=(hist-min(hist))/(max(hist)-min(hist)))
-#Normalization - consider standardization instead
+    mutate(hist_n=(hist-min(hist))/(max(hist)-min(hist)), #Normalization - consider standardization instead
+           cross_0=if_else(lag(hist)<=0&hist>=0|lag(hist)>=0&hist<=0,1,0),
+           cross_w=if_else(as.numeric(date-lag(date))>1,1,0),
+           cross=if_else(cross_0==1|cross_w==1,1,0)
+           ) %>%  
+    drop_na() %>% 
+## Hist Signal Analysis ##      
+  mutate(
+      #hwm=roll_min(abs(hist),last_n,fill=NA,align="right"),
+      #slope=(hist-lag(hist,last_n-1))/last_n,
+      interval=cumsum(cross)
+    ) %>% 
+  group_by(interval) %>% 
+  mutate(
+    pos=row_number(),
+    test=if_else(cross==0,
+      if_else(abs(hist)>=abs(lag(hist)),1,0),
+      1
+    ),
+    test=cumsum(test)
+  ) %>% 
+  mutate(
+    hwm=rollapply(abs(hist)#if_else(test==pos,abs(hist),0)
+                  ,pos,FUN=max,na.rm = F, align="right")
+  ) %>% 
+  mutate(
+    signal=if_else(cross==0,if_else(abs(hist)<abs(lag(hist))&abs(lag(hist))==hwm
+                   ,if_else(hist<=0,"buy","sell")
+                   ,"neutral"
+    ),"cross")
+  ) %>% 
+  drop_na() 
+  
+ 
+  ggplot(df %>% filter(year(date)==2020),aes(x=date)) +
+    geom_bar(stat="identity",aes(y=hist,fill=signal)) + 
+    geom_line(aes(y=close/10)) +
+    geom_point(data=df %>% filter(year(date)==2020,signal!="neutral"),aes(y=close/10,color=signal)) +
+    scale_y_continuous(
+      
+      # Features of the first axis
+      name = "hist",
+      
+      # Add a second axis and specify its features
+      sec.axis = sec_axis( trans=~.*10, name="MACD Histogram")
+    ) 
+
+
+
+
+## Sustained Return Trend Analysis ##
 
 y <- 2020
-per <- 5 #5 hours or 5 days of sustained increase/decrease
+per <- 12 #5 hours or 5 days of sustained increase/decrease
 del <- .03 #delta cutoff, e.g. 3% daily swings
 
 algo <- df %>% 
@@ -89,10 +146,13 @@ for (i in 2:per) {
 
 algo$return <- return-1
 algo <- algo %>% 
+    #mutate(upswing=as.numeric(per==roll_sum(lead(delta)>0,per, fill=NA, align="left"))) %>% #check for sustained positive trend too
     drop_na()
 
-ggplot(algo) +
-    geom_point(aes(x=hist_n,y=return)) 
+ggplot(algo,aes(x=hist_n,y=return)) +
+    geom_point() +
+  geom_smooth()
+
 
 
 #ggplot(df %>% filter(year(date)==2020), aes(x=date)) +
